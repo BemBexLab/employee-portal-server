@@ -130,6 +130,57 @@ export class SupabaseService implements OnModuleDestroy {
     }
   }
 
+  async findEmployeeCredential(identity: string) {
+    const identifier = identity.trim();
+
+    if (!identifier) {
+      throw new BadRequestException('identity must not be empty');
+    }
+
+    try {
+      const result = await this.pool.query<{
+        id: string;
+        employee_code: string;
+        name: string;
+        is_active: boolean;
+        password_hash: string;
+        email: string | null;
+      }>(
+        `SELECT
+           employee.id,
+           employee.employee_code,
+           employee.name,
+           employee.is_active,
+           portal_user.password_hash,
+           portal_user.email
+         FROM employees AS employee
+         LEFT JOIN users AS portal_user
+           ON portal_user.employee_id = employee.id
+         WHERE employee.id::text = $1
+            OR employee.employee_code = $1
+            OR LOWER(portal_user.email) = LOWER($1)
+         LIMIT 1`,
+        [identifier],
+      );
+
+      const row = result.rows[0];
+      if (!row || !row.password_hash) {
+        return null;
+      }
+
+      return {
+        id: row.id,
+        employeeCode: row.employee_code,
+        name: row.name,
+        email: row.email,
+        isActive: row.is_active,
+        passwordHash: row.password_hash,
+      };
+    } catch {
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
   async getEmployeePortal(employeeId: string) {
     const identifier = employeeId.trim();
 
