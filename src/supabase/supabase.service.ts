@@ -4,6 +4,7 @@ import {
   Inject,
   Injectable,
   InternalServerErrorException,
+  NotFoundException,
   OnModuleDestroy,
   Optional,
 } from '@nestjs/common';
@@ -450,6 +451,415 @@ export class SupabaseService implements OnModuleDestroy {
 
   async onModuleDestroy() {
     await this.pool.end();
+  }
+
+  async listRequests(employeeId: string) {
+    const identifier = employeeId.trim();
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+
+    try {
+      const employeeResult = await this.pool.query<{ id: string }>(
+        `SELECT id::text AS id
+         FROM employees
+         WHERE id::text = $1 OR employee_code = $1
+         LIMIT 1`,
+        [identifier],
+      );
+      const employeePk = employeeResult.rows[0]?.id;
+      if (!employeePk) return [];
+
+      const result = await this.pool.query<{
+        id: string;
+        kind: string;
+        leave_category: string | null;
+        from_date: string;
+        to_date: string;
+        reason: string;
+        note: string | null;
+        status: string;
+        submitted_at: Date;
+        decided_at: Date | null;
+      }>(
+        `SELECT
+           id,
+           kind::text AS kind,
+           leave_category::text AS leave_category,
+           from_date::text AS from_date,
+           to_date::text AS to_date,
+           reason,
+           note,
+           status::text AS status,
+           submitted_at,
+           decided_at
+         FROM employee_requests
+         WHERE employee_id = $1
+         ORDER BY submitted_at DESC
+         LIMIT 200`,
+        [employeePk],
+      );
+
+      return result.rows.map((row) => ({
+        id: row.id,
+        kind: row.kind,
+        leaveCategory: row.leave_category,
+        fromDate: row.from_date,
+        toDate: row.to_date,
+        reason: row.reason,
+        note: row.note,
+        status: row.status,
+        submittedAt: row.submitted_at,
+        decidedAt: row.decided_at,
+      }));
+    } catch {
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async createRequest(
+    employeeId: string,
+    payload: {
+      kind: 'LEAVE' | 'REMOTE_WORK';
+      leaveCategory?: 'ANNUAL_LEAVE' | 'SICK_LEAVE' | 'CASUAL_LEAVE' | 'UNPAID_LEAVE';
+      fromDate: string;
+      toDate: string;
+      reason: string;
+      note?: string | null;
+    },
+  ) {
+    const identifier = employeeId.trim();
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+
+    if (!payload.fromDate || !payload.toDate) {
+      throw new BadRequestException('fromDate and toDate are required');
+    }
+    if (payload.fromDate > payload.toDate) {
+      throw new BadRequestException('fromDate must be on or before toDate');
+    }
+    if (!payload.reason.trim()) {
+      throw new BadRequestException('reason is required');
+    }
+    if (payload.kind === 'LEAVE' && !payload.leaveCategory) {
+      throw new BadRequestException('leaveCategory is required for leave requests');
+    }
+
+    try {
+      const employeeResult = await this.pool.query<{
+        id: string;
+        organization_id: string;
+        is_active: boolean;
+      }>(
+        `SELECT id, organization_id, is_active
+         FROM employees
+         WHERE id::text = $1 OR employee_code = $1
+         LIMIT 1`,
+        [identifier],
+      );
+      const employee = employeeResult.rows[0];
+      if (!employee) {
+        throw new BadRequestException('No employee matches those details.');
+      }
+      if (!employee.is_active) {
+        throw new BadRequestException('Employee account is inactive.');
+      }
+
+      const insert = await this.pool.query<{
+        id: string;
+        submitted_at: Date;
+      }>(
+        `INSERT INTO employee_requests (
+           organization_id,
+           employee_id,
+           kind,
+           leave_category,
+           from_date,
+           to_date,
+           reason,
+           note
+         ) VALUES ($1, $2, $3::"RequestKind", $4::"LeaveCategory", $5::date, $6::date, $7, $8)
+         RETURNING id, submitted_at`,
+        [
+          employee.organization_id,
+          employee.id,
+          payload.kind,
+          payload.kind === 'LEAVE' ? payload.leaveCategory : null,
+          payload.fromDate,
+          payload.toDate,
+          payload.reason.trim(),
+          payload.note?.trim() || null,
+        ],
+      );
+
+      return {
+        id: insert.rows[0].id,
+        submittedAt: insert.rows[0].submitted_at,
+      };
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async deletePendingRequest(employeeId: string, requestId: string) {
+    const identifier = employeeId.trim();
+    const targetId = requestId.trim();
+
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+    if (!targetId) {
+      throw new BadRequestException('requestId must not be empty');
+    }
+
+    try {
+      const employeeResult = await this.pool.query<{ id: string }>(
+        `SELECT id FROM employees
+         WHERE id::text = $1 OR employee_code = $1
+         LIMIT 1`,
+        [identifier],
+      );
+      const employeePk = employeeResult.rows[0]?.id;
+      if (!employeePk) {
+        throw new NotFoundException('Request not found.');
+      }
+
+      const result = await this.pool.query<{ status: string }>(
+        `DELETE FROM employee_requests
+         WHERE id = $1
+           AND employee_id = $2
+           AND status = 'PENDING'
+         RETURNING status::text AS status`,
+        [targetId, employeePk],
+      );
+
+      if (result.rowCount === 0) {
+        throw new NotFoundException('Pending request not found.');
+      }
+    } catch (err) {
+      if (
+        err instanceof BadRequestException ||
+        err instanceof NotFoundException
+      ) {
+        throw err;
+      }
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async listCorrections(employeeId: string) {
+    const identifier = employeeId.trim();
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+
+    try {
+      const employeeResult = await this.pool.query<{ id: string }>(
+        `SELECT id FROM employees
+         WHERE id::text = $1 OR employee_code = $1
+         LIMIT 1`,
+        [identifier],
+      );
+      const employeePk = employeeResult.rows[0]?.id;
+      if (!employeePk) return [];
+
+      const result = await this.pool.query<{
+        id: string;
+        daily_attendance_id: string | null;
+        complaint_type: string;
+        expected_check_in: string | null;
+        expected_check_out: string | null;
+        description: string;
+        status: string;
+        submitted_at: Date;
+        decided_at: Date | null;
+        attendance_date: string | null;
+      }>(
+        `SELECT
+           c.id,
+           c.daily_attendance_id,
+           c.complaint_type::text AS complaint_type,
+           c.expected_check_in::text AS expected_check_in,
+           c.expected_check_out::text AS expected_check_out,
+           c.description,
+           c.status::text AS status,
+           c.submitted_at,
+           c.decided_at,
+           att.date::text AS attendance_date
+         FROM attendance_corrections c
+         LEFT JOIN daily_attendance att ON att.id = c.daily_attendance_id
+         WHERE c.employee_id = $1
+         ORDER BY c.submitted_at DESC
+         LIMIT 200`,
+        [employeePk],
+      );
+
+      return result.rows.map((row) => ({
+        id: row.id,
+        dailyAttendanceId: row.daily_attendance_id,
+        complaintType: row.complaint_type,
+        expectedCheckIn: row.expected_check_in,
+        expectedCheckOut: row.expected_check_out,
+        description: row.description,
+        status: row.status,
+        submittedAt: row.submitted_at,
+        decidedAt: row.decided_at,
+        attendanceDate: row.attendance_date,
+      }));
+    } catch {
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async createCorrection(
+    employeeId: string,
+    payload: {
+      dailyAttendanceId?: string | null;
+      complaintType:
+        | 'INCORRECT_CHECK_IN'
+        | 'INCORRECT_CHECK_OUT'
+        | 'INCORRECT_STATUS'
+        | 'MISSING_ATTENDANCE'
+        | 'OTHER';
+      expectedCheckIn?: string | null;
+      expectedCheckOut?: string | null;
+      description: string;
+    },
+  ) {
+    const identifier = employeeId.trim();
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+    if (!payload.description.trim()) {
+      throw new BadRequestException('description is required');
+    }
+
+    try {
+      const employeeResult = await this.pool.query<{
+        id: string;
+        organization_id: string;
+        is_active: boolean;
+      }>(
+        `SELECT id, organization_id, is_active
+         FROM employees
+         WHERE id::text = $1 OR employee_code = $1
+         LIMIT 1`,
+        [identifier],
+      );
+      const employee = employeeResult.rows[0];
+      if (!employee) {
+        throw new BadRequestException('No employee matches those details.');
+      }
+      if (!employee.is_active) {
+        throw new BadRequestException('Employee account is inactive.');
+      }
+
+      const dailyId = payload.dailyAttendanceId?.trim() || null;
+      if (dailyId) {
+        const ownership = await this.pool.query<{ employee_id: string }>(
+          `SELECT employee_id::text AS employee_id
+           FROM daily_attendance
+           WHERE id::text = $1
+           LIMIT 1`,
+          [dailyId],
+        );
+        const owner = ownership.rows[0]?.employee_id;
+        if (!owner) {
+          throw new BadRequestException(
+            'The selected attendance record could not be found.',
+          );
+        }
+        if (owner !== employee.id) {
+          throw new BadRequestException(
+            'The selected attendance record does not belong to this employee.',
+          );
+        }
+      }
+
+      const insert = await this.pool.query<{
+        id: string;
+        submitted_at: Date;
+      }>(
+        `INSERT INTO attendance_corrections (
+           organization_id,
+           employee_id,
+           daily_attendance_id,
+           complaint_type,
+           expected_check_in,
+           expected_check_out,
+           description
+         ) VALUES (
+           $1, $2, $3, $4::"ComplaintType",
+           $5::time, $6::time, $7
+         )
+         RETURNING id, submitted_at`,
+        [
+          employee.organization_id,
+          employee.id,
+          dailyId,
+          payload.complaintType,
+          payload.expectedCheckIn?.trim() || null,
+          payload.expectedCheckOut?.trim() || null,
+          payload.description.trim(),
+        ],
+      );
+
+      return {
+        id: insert.rows[0].id,
+        submittedAt: insert.rows[0].submitted_at,
+      };
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async deletePendingCorrection(employeeId: string, correctionId: string) {
+    const identifier = employeeId.trim();
+    const targetId = correctionId.trim();
+
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+    if (!targetId) {
+      throw new BadRequestException('correctionId must not be empty');
+    }
+
+    try {
+      const employeeResult = await this.pool.query<{ id: string }>(
+        `SELECT id FROM employees
+         WHERE id::text = $1 OR employee_code = $1
+         LIMIT 1`,
+        [identifier],
+      );
+      const employeePk = employeeResult.rows[0]?.id;
+      if (!employeePk) {
+        throw new NotFoundException('Correction not found.');
+      }
+
+      const result = await this.pool.query<{ status: string }>(
+        `DELETE FROM attendance_corrections
+         WHERE id = $1
+           AND employee_id = $2
+           AND status = 'PENDING'
+         RETURNING status::text AS status`,
+        [targetId, employeePk],
+      );
+
+      if (result.rowCount === 0) {
+        throw new NotFoundException('Pending correction not found.');
+      }
+    } catch (err) {
+      if (
+        err instanceof BadRequestException ||
+        err instanceof NotFoundException
+      ) {
+        throw err;
+      }
+      throw new BadGatewayException('Database request failed');
+    }
   }
 
   private getRequiredConfig(name: string): string {
