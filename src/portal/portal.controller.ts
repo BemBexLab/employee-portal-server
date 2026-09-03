@@ -7,6 +7,7 @@ import {
   NotFoundException,
   Param,
   Post,
+  Query,
   Req,
   Res,
   UnauthorizedException,
@@ -91,8 +92,7 @@ export class PortalController {
   ) {
     const identity =
       typeof body.identity === 'string' ? body.identity.trim() : '';
-    const password =
-      typeof body.password === 'string' ? body.password : '';
+    const password = typeof body.password === 'string' ? body.password : '';
 
     if (!identity || !password) {
       throw new UnauthorizedException(
@@ -103,22 +103,19 @@ export class PortalController {
     const record = await this.supabaseService.findEmployeeCredential(identity);
 
     if (!record || !record.isActive || !record.passwordHash) {
-      throw new UnauthorizedException(
-        'No employee matches those details.',
-      );
+      throw new UnauthorizedException('No employee matches those details.');
     }
 
     const ok = await bcrypt.compare(password, record.passwordHash);
     if (!ok) {
-      throw new UnauthorizedException(
-        'No employee matches those details.',
-      );
+      throw new UnauthorizedException('No employee matches those details.');
     }
 
-    const secret =
-      process.env.COOKIE_SECRET ?? process.env.JWT_SECRET ?? '';
+    const secret = process.env.COOKIE_SECRET ?? process.env.JWT_SECRET ?? '';
     if (!secret) {
-      throw new UnauthorizedException('Server session secret is not configured.');
+      throw new UnauthorizedException(
+        'Server session secret is not configured.',
+      );
     }
 
     response.cookie(SESSION_COOKIE, record.employeeCode, {
@@ -167,9 +164,8 @@ export class PortalController {
       throw new UnauthorizedException('Not signed in.');
     }
 
-    const kind = body.kind === 'LEAVE' || body.kind === 'REMOTE_WORK'
-      ? body.kind
-      : null;
+    const kind =
+      body.kind === 'LEAVE' || body.kind === 'REMOTE_WORK' ? body.kind : null;
     if (!kind) {
       throw new UnauthorizedException('Invalid request kind.');
     }
@@ -228,6 +224,26 @@ export class PortalController {
     return this.supabaseService.listCorrections(employeeCode);
   }
 
+  @Get('deductions')
+  async getDeductions(
+    @Query('cycle') cycle: string | undefined,
+    @Req() request: Request,
+  ) {
+    const employeeCode = await this.resolveEmployeeCode(request);
+    if (!employeeCode) {
+      throw new UnauthorizedException('Not signed in.');
+    }
+    const cycleKey = cycle?.trim() || undefined;
+    const data = await this.supabaseService.getPayrollDeduction(
+      employeeCode,
+      cycleKey,
+    );
+    if (!data) {
+      throw new NotFoundException('No deduction record found.');
+    }
+    return data;
+  }
+
   @Post('corrections')
   @HttpCode(201)
   async createCorrection(
@@ -255,9 +271,7 @@ export class PortalController {
           : null,
       complaintType: body.complaintType,
       expectedCheckIn:
-        typeof body.expectedCheckIn === 'string'
-          ? body.expectedCheckIn
-          : null,
+        typeof body.expectedCheckIn === 'string' ? body.expectedCheckIn : null,
       expectedCheckOut:
         typeof body.expectedCheckOut === 'string'
           ? body.expectedCheckOut
@@ -291,9 +305,7 @@ export class PortalController {
       : null;
   }
 
-  private async resolveEmployeeCode(
-    request: Request,
-  ): Promise<string | null> {
+  private async resolveEmployeeCode(request: Request): Promise<string | null> {
     const trusted = this.trustedBffHeader(request);
     if (trusted) return trusted;
 

@@ -138,6 +138,70 @@ describe('SupabaseService', () => {
     await expect(service.getEmployeePortal('missing')).resolves.toBeNull();
   });
 
+  it('returns the latest deduction row when no cycle is supplied', async () => {
+    query
+      .mockResolvedValueOnce({ rows: [{ id: 'employee-uuid-108' }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            payroll_cycle_month: '2026-08',
+            late_days: 0,
+            half_days: 3,
+            absent_days: 0,
+            late_half_day_deduction_days: 1,
+            total_deduction_days: 1,
+            monthly_salary: '60000.00',
+            employee_monthly_salary: '60000.00',
+            payroll_days: 32,
+            daily_rate: '1875.00',
+            deduction_amount: '1875.00',
+            calculated_through: '2026-09-04',
+          },
+        ],
+      });
+
+    await expect(service.getPayrollDeduction('108')).resolves.toEqual({
+      cycle: '2026-08',
+      lateDays: 0,
+      halfDays: 3,
+      absentDays: 0,
+      lateHalfDayDeductionDays: 1,
+      totalDeductionDays: 1,
+      monthlySalary: 60000,
+      payrollDays: 32,
+      dailyRate: 1875,
+      deductionAmount: 1875,
+      calculatedThrough: '2026-09-04',
+    });
+
+    expect(query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining(
+        'ORDER BY d.payroll_cycle_month DESC, d.updated_at DESC',
+      ),
+      ['employee-uuid-108'],
+    );
+    expect(query.mock.calls[1][0]).not.toContain(
+      'AND d.payroll_cycle_month = $2',
+    );
+  });
+
+  it('still filters deductions when a cycle is supplied', async () => {
+    query
+      .mockResolvedValueOnce({ rows: [{ id: 'employee-uuid-108' }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await expect(
+      service.getPayrollDeduction('108', '2026-08'),
+    ).resolves.toBeNull();
+
+    expect(query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('AND d.payroll_cycle_month = $2'),
+      ['employee-uuid-108', '2026-08'],
+    );
+  });
+
   it.each([
     [0, 0],
     [101, 0],

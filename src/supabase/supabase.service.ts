@@ -182,6 +182,124 @@ export class SupabaseService implements OnModuleDestroy {
     }
   }
 
+  async getPayrollDeduction(
+    employeeId: string,
+    cycleKey?: string,
+  ): Promise<{
+    cycle: string;
+    lateDays: number;
+    halfDays: number;
+    absentDays: number;
+    lateHalfDayDeductionDays: number;
+    totalDeductionDays: number;
+    monthlySalary: number;
+    payrollDays: number;
+    dailyRate: number;
+    deductionAmount: number;
+    calculatedThrough: string | null;
+  } | null> {
+    const identifier = employeeId.trim();
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+
+    const normalizedCycleKey = cycleKey?.trim();
+    if (
+      cycleKey !== undefined &&
+      (!normalizedCycleKey ||
+        !/^\d{4}-(0[1-9]|1[0-2])$/.test(normalizedCycleKey))
+    ) {
+      throw new BadRequestException(
+        'cycle must be a YYYY-MM payroll cycle key',
+      );
+    }
+
+    try {
+      const employeeResult = await this.pool.query<{ id: string }>(
+        `SELECT id FROM employees
+         WHERE id::text = $1 OR employee_code = $1
+         LIMIT 1`,
+        [identifier],
+      );
+      const employeePk = employeeResult.rows[0]?.id;
+      if (!employeePk) return null;
+
+      const cycleFilter = normalizedCycleKey
+        ? ' AND d.payroll_cycle_month = $2'
+        : '';
+      const result = await this.pool.query<{
+        payroll_cycle_month: string;
+        late_days: number;
+        half_days: number;
+        absent_days: number;
+        late_half_day_deduction_days: number;
+        total_deduction_days: number;
+        monthly_salary: string;
+        employee_monthly_salary: string | null;
+        payroll_days: number;
+        daily_rate: string;
+        deduction_amount: string;
+        calculated_through: string | null;
+      }>(
+        `SELECT
+           d.payroll_cycle_month,
+           d.late_days,
+           d.half_days,
+           d.absent_days,
+           d.late_half_day_deduction_days,
+           d.total_deduction_days,
+           d.monthly_salary::text AS monthly_salary,
+           e.monthly_salary::text AS employee_monthly_salary,
+           d.payroll_days,
+           d.daily_rate::text AS daily_rate,
+           d.deduction_amount::text AS deduction_amount,
+           d.calculated_through
+         FROM public.deductions d
+         JOIN public.employees e ON e.id = d.employee_id
+         WHERE d.employee_id = $1
+           ${cycleFilter}
+         ORDER BY d.payroll_cycle_month DESC, d.updated_at DESC
+         LIMIT 1`,
+        normalizedCycleKey ? [employeePk, normalizedCycleKey] : [employeePk],
+      );
+
+      const row = result.rows[0];
+      if (!row) return null;
+
+      const monthlySalary =
+        row.monthly_salary !== null && Number(row.monthly_salary) > 0
+          ? Number(row.monthly_salary)
+          : row.employee_monthly_salary !== null
+            ? Number(row.employee_monthly_salary)
+            : 0;
+      const dailyRate =
+        monthlySalary > 0 && row.payroll_days > 0
+          ? Math.round((monthlySalary / row.payroll_days) * 100) / 100
+          : Number(row.daily_rate);
+      const snapshotDeduction = Number(row.deduction_amount);
+      const deductionAmount =
+        monthlySalary > 0
+          ? Math.round(dailyRate * row.total_deduction_days)
+          : snapshotDeduction;
+
+      return {
+        cycle: row.payroll_cycle_month,
+        lateDays: row.late_days,
+        halfDays: row.half_days,
+        absentDays: row.absent_days,
+        lateHalfDayDeductionDays: row.late_half_day_deduction_days,
+        totalDeductionDays: row.total_deduction_days,
+        monthlySalary,
+        payrollDays: row.payroll_days,
+        dailyRate,
+        deductionAmount,
+        calculatedThrough: row.calculated_through,
+      };
+    } catch {
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
   async getEmployeePortal(employeeId: string) {
     const identifier = employeeId.trim();
 
@@ -521,7 +639,8 @@ export class SupabaseService implements OnModuleDestroy {
     employeeId: string,
     payload: {
       kind: 'LEAVE' | 'REMOTE_WORK';
-      leaveCategory?: 'ANNUAL_LEAVE' | 'SICK_LEAVE' | 'CASUAL_LEAVE' | 'UNPAID_LEAVE';
+      leaveCategory?:
+        'ANNUAL_LEAVE' | 'SICK_LEAVE' | 'CASUAL_LEAVE' | 'UNPAID_LEAVE';
       fromDate: string;
       toDate: string;
       reason: string;
@@ -543,7 +662,9 @@ export class SupabaseService implements OnModuleDestroy {
       throw new BadRequestException('reason is required');
     }
     if (payload.kind === 'LEAVE' && !payload.leaveCategory) {
-      throw new BadRequestException('leaveCategory is required for leave requests');
+      throw new BadRequestException(
+        'leaveCategory is required for leave requests',
+      );
     }
 
     try {
