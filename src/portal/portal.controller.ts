@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -11,10 +12,21 @@ import {
   Req,
   Res,
   UnauthorizedException,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
 import * as bcrypt from 'bcryptjs';
 import { SupabaseService } from '../supabase/supabase.service';
+import {
+  MAX_FILES_PER_REQUEST,
+  MAX_FILE_SIZE_BYTES,
+  computeExpiresAt,
+  deleteAttachmentFile,
+  isAllowedAttachment,
+  saveAttachment,
+} from '../attachments/attachment-storage';
+import type { StoredAttachment } from '../attachments/attachment-storage';
 
 type LoginBody = {
   identity?: unknown;
@@ -155,9 +167,14 @@ export class PortalController {
 
   @Post('requests')
   @HttpCode(201)
+  @UseInterceptors(
+    FilesInterceptor('attachments', MAX_FILES_PER_REQUEST, {
+      limits: { fileSize: MAX_FILE_SIZE_BYTES },
+    }),
+  )
   async createRequest(
-    @Body() body: CreateRequestBody,
     @Req() request: Request,
+    @Body() body: CreateRequestBody,
   ) {
     const employeeCode = await this.resolveEmployeeCode(request);
     if (!employeeCode) {
@@ -189,17 +206,98 @@ export class PortalController {
       throw new UnauthorizedException('Leave category is required.');
     }
 
-    return this.supabaseService.createRequest(employeeCode, {
-      kind,
-      leaveCategory:
-        kind === 'LEAVE' && isLeaveCategory(body.leaveCategory)
-          ? body.leaveCategory
-          : undefined,
-      fromDate,
-      toDate,
-      reason,
-      note,
-    });
+    const incomingFiles = Array.isArray(
+      (request as Request & { files?: unknown }).files,
+    )
+      ? ((request as Request & { files?: Express.Multer.File[] }).files ?? [])
+      : [];
+
+    const stored: StoredAttachment[] = [];
+    const failedReasons: string[] = [];
+    for (const file of incomingFiles) {
+      const originalName = file.originalname;
+      const mimeType = file.mimetype || 'application/octet-stream';
+      if (!isAllowedAttachment(originalName, mimeType)) {
+        failedReasons.push(`${originalName}: file type not allowed`);
+        continue;
+      }
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        failedReasons.push(`${originalName}: exceeds the 10 MB limit`);
+        continue;
+      }
+      try {
+        stored.push(await saveAttachment(originalName, mimeType, file.buffer));
+      } catch (err) {
+        failedReasons.push(
+          `${originalName}: ${err instanceof Error ? err.message : 'upload failed'}`,
+        );
+      }
+    }
+
+    if (failedReasons.length > 0 && stored.length === 0) {
+      await Promise.all(
+        stored.map((entry) => deleteAttachmentFile(entry.storagePath)),
+      );
+      throw new BadRequestException(failedReasons.join('; '));
+    }
+
+    let created: {
+      id: string;
+      submittedAt: Date | string;
+      organizationId: string;
+      employeeId: string;
+    };
+    try {
+      created = await this.supabaseService.createRequest(employeeCode, {
+        kind,
+        leaveCategory:
+          kind === 'LEAVE' && isLeaveCategory(body.leaveCategory)
+            ? body.leaveCategory
+            : undefined,
+        fromDate,
+        toDate,
+        reason,
+        note,
+      });
+    } catch (err) {
+      await Promise.all(
+        stored.map((entry) => deleteAttachmentFile(entry.storagePath)),
+      );
+      throw err;
+    }
+
+    let attachments: Array<{
+      id: string;
+      originalName: string;
+      storedName: string;
+      mimeType: string;
+      sizeBytes: number;
+      uploadedAt: Date;
+      expiresAt: Date;
+    }> = [];
+    if (stored.length > 0) {
+      try {
+        attachments = await this.supabaseService.createRequestAttachments({
+          requestId: created.id,
+          organizationId: created.organizationId,
+          employeeId: created.employeeId,
+          expiresAt: computeExpiresAt(),
+          files: stored,
+        });
+      } catch (err) {
+        await Promise.all(
+          stored.map((entry) => deleteAttachmentFile(entry.storagePath)),
+        );
+        throw err;
+      }
+    }
+
+    return {
+      id: created.id,
+      submittedAt: created.submittedAt,
+      attachments,
+      ...(failedReasons.length > 0 ? { warnings: failedReasons } : {}),
+    };
   }
 
   @Delete('requests/:requestId')
@@ -212,7 +310,80 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    await this.supabaseService.deletePendingRequest(employeeCode, requestId);
+    const paths = await this.supabaseService.deletePendingRequest(
+      employeeCode,
+      requestId,
+    );
+    await Promise.all(
+      paths.map((entry) => deleteAttachmentFile(entry.storagePath)),
+    );
+  }
+
+  @Get('requests/:requestId/attachments')
+  async listRequestAttachments(
+    @Param('requestId') requestId: string,
+    @Req() request: Request,
+  ) {
+    const employeeCode = await this.resolveEmployeeCode(request);
+    if (!employeeCode) {
+      throw new UnauthorizedException('Not signed in.');
+    }
+    return this.supabaseService.listRequestAttachments(requestId);
+  }
+
+  @Get('requests/:requestId/attachments/:attachmentId')
+  async downloadRequestAttachment(
+    @Param('requestId') _requestId: string,
+    @Param('attachmentId') attachmentId: string,
+    @Req() request: Request,
+    @Res() response: Response,
+  ) {
+    const employeeCode = await this.resolveEmployeeCode(request);
+    if (!employeeCode) {
+      throw new UnauthorizedException('Not signed in.');
+    }
+    const attachment = await this.supabaseService.getRequestAttachment(
+      employeeCode,
+      attachmentId,
+    );
+    if (attachment.expiresAt.getTime() <= Date.now()) {
+      throw new NotFoundException('Attachment has expired.');
+    }
+    const { promises: fs } = await import('fs');
+    try {
+      const buffer = await fs.readFile(attachment.storagePath);
+      response.setHeader(
+        'Content-Type',
+        attachment.mimeType || 'application/octet-stream',
+      );
+      const encoded = encodeURIComponent(attachment.originalName);
+      response.setHeader(
+        'Content-Disposition',
+        `attachment; filename*=UTF-8''${encoded}`,
+      );
+      response.setHeader('Content-Length', String(buffer.length));
+      response.status(200).end(buffer);
+    } catch {
+      throw new NotFoundException('Attachment file is missing.');
+    }
+  }
+
+  @Delete('requests/:requestId/attachments/:attachmentId')
+  @HttpCode(204)
+  async deleteRequestAttachment(
+    @Param('requestId') _requestId: string,
+    @Param('attachmentId') attachmentId: string,
+    @Req() request: Request,
+  ) {
+    const employeeCode = await this.resolveEmployeeCode(request);
+    if (!employeeCode) {
+      throw new UnauthorizedException('Not signed in.');
+    }
+    const storagePath = await this.supabaseService.deleteRequestAttachment(
+      employeeCode,
+      attachmentId,
+    );
+    await deleteAttachmentFile(storagePath);
   }
 
   @Get('corrections')

@@ -196,6 +196,7 @@ export class SupabaseService implements OnModuleDestroy {
     payrollDays: number;
     dailyRate: number;
     deductionAmount: number;
+    allowanceAmount: number;
     calculatedThrough: string | null;
   } | null> {
     const identifier = employeeId.trim();
@@ -236,6 +237,7 @@ export class SupabaseService implements OnModuleDestroy {
         total_deduction_days: number;
         monthly_salary: string;
         employee_monthly_salary: string | null;
+        employee_allowance: string | null;
         payroll_days: number;
         daily_rate: string;
         deduction_amount: string;
@@ -250,6 +252,7 @@ export class SupabaseService implements OnModuleDestroy {
            d.total_deduction_days,
            d.monthly_salary::text AS monthly_salary,
            e.monthly_salary::text AS employee_monthly_salary,
+           e.allowance::text AS employee_allowance,
            d.payroll_days,
            d.daily_rate::text AS daily_rate,
            d.deduction_amount::text AS deduction_amount,
@@ -276,11 +279,14 @@ export class SupabaseService implements OnModuleDestroy {
         monthlySalary > 0 && row.payroll_days > 0
           ? Math.round((monthlySalary / row.payroll_days) * 100) / 100
           : Number(row.daily_rate);
-      const snapshotDeduction = Number(row.deduction_amount);
-      const deductionAmount =
-        monthlySalary > 0
-          ? Math.round(dailyRate * row.total_deduction_days)
-          : snapshotDeduction;
+      const deductionAmount = Math.max(
+        0,
+        Number(row.deduction_amount) || 0,
+      );
+      const allowanceAmount =
+        row.total_deduction_days >= 1
+          ? Math.max(0, Number(row.employee_allowance) || 0)
+          : 0;
 
       return {
         cycle: row.payroll_cycle_month,
@@ -293,6 +299,7 @@ export class SupabaseService implements OnModuleDestroy {
         payrollDays: row.payroll_days,
         dailyRate,
         deductionAmount,
+        allowanceAmount,
         calculatedThrough: row.calculated_through,
       };
     } catch {
@@ -314,6 +321,7 @@ export class SupabaseService implements OnModuleDestroy {
         name: string;
         is_active: boolean;
         monthly_salary: string;
+        allowance: string | null;
         created_at: Date;
         department: string | null;
         organization: string;
@@ -327,6 +335,7 @@ export class SupabaseService implements OnModuleDestroy {
            employee.name,
            employee.is_active,
            employee.monthly_salary,
+           employee.allowance,
            employee.created_at,
            department.name AS department,
            organization.name AS organization,
@@ -404,6 +413,7 @@ export class SupabaseService implements OnModuleDestroy {
           email: employee.email,
           isActive: employee.is_active,
           monthlySalary: Number(employee.monthly_salary),
+          allowance: Math.max(0, Number(employee.allowance) || 0),
           joinedAt: employee.created_at,
           department: employee.department,
           organization: employee.organization,
@@ -618,7 +628,50 @@ export class SupabaseService implements OnModuleDestroy {
         [employeePk],
       );
 
-      return result.rows.map((row) => ({
+      const rows = result.rows;
+      if (rows.length === 0) return [];
+
+      const attachmentsResult = await this.pool.query<{
+        id: string;
+        request_id: string;
+        original_name: string;
+        mime_type: string;
+        size_bytes: string;
+        uploaded_at: Date;
+        expires_at: Date;
+      }>(
+        `SELECT id, request_id, original_name, mime_type, size_bytes, uploaded_at, expires_at
+         FROM request_attachments
+         WHERE employee_id = $1
+           AND request_id = ANY($2::uuid[])`,
+        [employeePk, rows.map((row) => row.id)],
+      );
+
+      const grouped = new Map<
+        string,
+        Array<{
+          id: string;
+          originalName: string;
+          mimeType: string;
+          sizeBytes: number;
+          uploadedAt: Date;
+          expiresAt: Date;
+        }>
+      >();
+      for (const att of attachmentsResult.rows) {
+        const list = grouped.get(att.request_id) ?? [];
+        list.push({
+          id: att.id,
+          originalName: att.original_name,
+          mimeType: att.mime_type,
+          sizeBytes: Number(att.size_bytes),
+          uploadedAt: att.uploaded_at,
+          expiresAt: att.expires_at,
+        });
+        grouped.set(att.request_id, list);
+      }
+
+      return rows.map((row) => ({
         id: row.id,
         kind: row.kind,
         leaveCategory: row.leave_category,
@@ -629,6 +682,7 @@ export class SupabaseService implements OnModuleDestroy {
         status: row.status,
         submittedAt: row.submitted_at,
         decidedAt: row.decided_at,
+        attachments: grouped.get(row.id) ?? [],
       }));
     } catch {
       throw new BadGatewayException('Database request failed');
@@ -717,6 +771,8 @@ export class SupabaseService implements OnModuleDestroy {
       return {
         id: insert.rows[0].id,
         submittedAt: insert.rows[0].submitted_at,
+        organizationId: employee.organization_id,
+        employeeId: employee.id,
       };
     } catch (err) {
       if (err instanceof BadRequestException) throw err;
@@ -747,6 +803,13 @@ export class SupabaseService implements OnModuleDestroy {
         throw new NotFoundException('Request not found.');
       }
 
+      const attachments = await this.pool.query<{ storage_path: string }>(
+        `DELETE FROM request_attachments
+         WHERE request_id = $1 AND employee_id = $2
+         RETURNING storage_path`,
+        [targetId, employeePk],
+      );
+
       const result = await this.pool.query<{ status: string }>(
         `DELETE FROM employee_requests
          WHERE id = $1
@@ -756,9 +819,13 @@ export class SupabaseService implements OnModuleDestroy {
         [targetId, employeePk],
       );
 
-      if (result.rowCount === 0) {
+      if (result.rowCount === 0 && attachments.rowCount === 0) {
         throw new NotFoundException('Pending request not found.');
       }
+
+      return attachments.rows.map((row) => ({
+        storagePath: row.storage_path,
+      }));
     } catch (err) {
       if (
         err instanceof BadRequestException ||
@@ -995,5 +1062,212 @@ export class SupabaseService implements OnModuleDestroy {
 
   private quoteIdentifier(identifier: string): string {
     return `"${identifier.replaceAll('"', '""')}"`;
+  }
+
+  async createRequestAttachments(args: {
+    requestId: string;
+    organizationId: string;
+    employeeId: string;
+    expiresAt: Date;
+    files: Array<{
+      originalName: string;
+      storedName: string;
+      mimeType: string;
+      sizeBytes: number;
+      storagePath: string;
+    }>;
+  }) {
+    if (args.files.length === 0) return [];
+    try {
+      const values: unknown[] = [];
+      const placeholders: string[] = [];
+      args.files.forEach((file, index) => {
+        const base = index * 8;
+        placeholders.push(
+          `($${base + 1}::uuid, $${base + 2}::uuid, $${base + 3}::uuid, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::bigint, $${base + 8}, $${base + 9}::timestamptz)`,
+        );
+        values.push(
+          args.requestId,
+          args.organizationId,
+          args.employeeId,
+          file.originalName,
+          file.storedName,
+          file.mimeType,
+          file.sizeBytes,
+          file.storagePath,
+          args.expiresAt,
+        );
+      });
+      const result = await this.pool.query<{
+        id: string;
+        original_name: string;
+        stored_name: string;
+        mime_type: string;
+        size_bytes: string;
+        uploaded_at: Date;
+        expires_at: Date;
+      }>(
+        `INSERT INTO request_attachments
+           (request_id, organization_id, employee_id, original_name, stored_name, mime_type, size_bytes, storage_path, expires_at)
+         VALUES ${placeholders.join(', ')}
+         RETURNING id, original_name, stored_name, mime_type, size_bytes, uploaded_at, expires_at`,
+        values,
+      );
+      return result.rows.map((row) => ({
+        id: row.id,
+        originalName: row.original_name,
+        storedName: row.stored_name,
+        mimeType: row.mime_type,
+        sizeBytes: Number(row.size_bytes),
+        uploadedAt: row.uploaded_at,
+        expiresAt: row.expires_at,
+      }));
+    } catch {
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async listRequestAttachments(requestId: string) {
+    try {
+      const result = await this.pool.query<{
+        id: string;
+        original_name: string;
+        stored_name: string;
+        mime_type: string;
+        size_bytes: string;
+        uploaded_at: Date;
+        expires_at: Date;
+      }>(
+        `SELECT id, original_name, stored_name, mime_type, size_bytes, uploaded_at, expires_at
+         FROM request_attachments
+         WHERE request_id = $1
+         ORDER BY uploaded_at ASC`,
+        [requestId],
+      );
+      return result.rows.map((row) => ({
+        id: row.id,
+        originalName: row.original_name,
+        storedName: row.stored_name,
+        mimeType: row.mime_type,
+        sizeBytes: Number(row.size_bytes),
+        uploadedAt: row.uploaded_at,
+        expiresAt: row.expires_at,
+      }));
+    } catch {
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async getRequestAttachment(employeeId: string, attachmentId: string) {
+    const identifier = employeeId.trim();
+    const target = attachmentId.trim();
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+    if (!target) {
+      throw new BadRequestException('attachmentId must not be empty');
+    }
+    try {
+      const employeeResult = await this.pool.query<{ id: string }>(
+        `SELECT id FROM employees WHERE id::text = $1 OR employee_code = $1 LIMIT 1`,
+        [identifier],
+      );
+      const employeePk = employeeResult.rows[0]?.id;
+      if (!employeePk) {
+        throw new NotFoundException('Attachment not found.');
+      }
+      const result = await this.pool.query<{
+        id: string;
+        original_name: string;
+        stored_name: string;
+        mime_type: string;
+        size_bytes: string;
+        storage_path: string;
+        expires_at: Date;
+      }>(
+        `SELECT id, original_name, stored_name, mime_type, size_bytes, storage_path, expires_at
+         FROM request_attachments
+         WHERE id = $1 AND employee_id = $2
+         LIMIT 1`,
+        [target, employeePk],
+      );
+      const row = result.rows[0];
+      if (!row) {
+        throw new NotFoundException('Attachment not found.');
+      }
+      return {
+        id: row.id,
+        originalName: row.original_name,
+        storedName: row.stored_name,
+        mimeType: row.mime_type,
+        sizeBytes: Number(row.size_bytes),
+        storagePath: row.storage_path,
+        expiresAt: row.expires_at,
+      };
+    } catch (err) {
+      if (
+        err instanceof BadRequestException ||
+        err instanceof NotFoundException
+      ) {
+        throw err;
+      }
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async deleteRequestAttachment(employeeId: string, attachmentId: string) {
+    const identifier = employeeId.trim();
+    const target = attachmentId.trim();
+    if (!identifier) {
+      throw new BadRequestException('employeeId must not be empty');
+    }
+    if (!target) {
+      throw new BadRequestException('attachmentId must not be empty');
+    }
+    try {
+      const employeeResult = await this.pool.query<{ id: string }>(
+        `SELECT id FROM employees WHERE id::text = $1 OR employee_code = $1 LIMIT 1`,
+        [identifier],
+      );
+      const employeePk = employeeResult.rows[0]?.id;
+      if (!employeePk) {
+        throw new NotFoundException('Attachment not found.');
+      }
+      const result = await this.pool.query<{ storage_path: string }>(
+        `DELETE FROM request_attachments
+         WHERE id = $1 AND employee_id = $2
+         RETURNING storage_path`,
+        [target, employeePk],
+      );
+      if (result.rowCount === 0) {
+        throw new NotFoundException('Attachment not found.');
+      }
+      return result.rows[0].storage_path;
+    } catch (err) {
+      if (
+        err instanceof BadRequestException ||
+        err instanceof NotFoundException
+      ) {
+        throw err;
+      }
+      throw new BadGatewayException('Database request failed');
+    }
+  }
+
+  async findExpiredAttachmentPaths(now: Date) {
+    try {
+      const result = await this.pool.query<{
+        id: string;
+        storage_path: string;
+      }>(
+        `DELETE FROM request_attachments
+         WHERE expires_at <= $1
+         RETURNING id, storage_path`,
+        [now],
+      );
+      return result.rows;
+    } catch {
+      throw new BadGatewayException('Database request failed');
+    }
   }
 }
