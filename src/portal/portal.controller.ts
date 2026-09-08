@@ -17,12 +17,11 @@ import {
 import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
 import * as bcrypt from 'bcryptjs';
-import { SupabaseService } from '../supabase/supabase.service';
+import { DatabaseService } from '../database/database.service';
 import {
   MAX_FILES_PER_REQUEST,
   MAX_FILE_SIZE_BYTES,
   computeExpiresAt,
-  deleteAttachmentFile,
   isAllowedAttachment,
   saveAttachment,
 } from '../attachments/attachment-storage';
@@ -86,11 +85,11 @@ const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 12;
 
 @Controller('portal')
 export class PortalController {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly databaseService: DatabaseService) {}
 
   @Get('employees/:employeeId')
   async getEmployeePortal(@Param('employeeId') employeeId: string) {
-    const data = await this.supabaseService.getEmployeePortal(employeeId);
+    const data = await this.databaseService.getEmployeePortal(employeeId);
     if (!data) throw new NotFoundException('Employee not found');
     return data;
   }
@@ -112,7 +111,7 @@ export class PortalController {
       );
     }
 
-    const record = await this.supabaseService.findEmployeeCredential(identity);
+    const record = await this.databaseService.findEmployeeCredential(identity);
 
     if (!record || !record.isActive || !record.passwordHash) {
       throw new UnauthorizedException('No employee matches those details.');
@@ -162,7 +161,7 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    return this.supabaseService.listRequests(employeeCode);
+    return this.databaseService.listRequests(employeeCode);
   }
 
   @Post('requests')
@@ -226,7 +225,7 @@ export class PortalController {
         continue;
       }
       try {
-        stored.push(await saveAttachment(originalName, mimeType, file.buffer));
+        stored.push(saveAttachment(originalName, mimeType, file.buffer));
       } catch (err) {
         failedReasons.push(
           `${originalName}: ${err instanceof Error ? err.message : 'upload failed'}`,
@@ -235,36 +234,20 @@ export class PortalController {
     }
 
     if (failedReasons.length > 0 && stored.length === 0) {
-      await Promise.all(
-        stored.map((entry) => deleteAttachmentFile(entry.storagePath)),
-      );
       throw new BadRequestException(failedReasons.join('; '));
     }
 
-    let created: {
-      id: string;
-      submittedAt: Date | string;
-      organizationId: string;
-      employeeId: string;
-    };
-    try {
-      created = await this.supabaseService.createRequest(employeeCode, {
-        kind,
-        leaveCategory:
-          kind === 'LEAVE' && isLeaveCategory(body.leaveCategory)
-            ? body.leaveCategory
-            : undefined,
-        fromDate,
-        toDate,
-        reason,
-        note,
-      });
-    } catch (err) {
-      await Promise.all(
-        stored.map((entry) => deleteAttachmentFile(entry.storagePath)),
-      );
-      throw err;
-    }
+    const created = await this.databaseService.createRequest(employeeCode, {
+      kind,
+      leaveCategory:
+        kind === 'LEAVE' && isLeaveCategory(body.leaveCategory)
+          ? body.leaveCategory
+          : undefined,
+      fromDate,
+      toDate,
+      reason,
+      note,
+    });
 
     let attachments: Array<{
       id: string;
@@ -276,20 +259,13 @@ export class PortalController {
       expiresAt: Date;
     }> = [];
     if (stored.length > 0) {
-      try {
-        attachments = await this.supabaseService.createRequestAttachments({
-          requestId: created.id,
-          organizationId: created.organizationId,
-          employeeId: created.employeeId,
-          expiresAt: computeExpiresAt(),
-          files: stored,
-        });
-      } catch (err) {
-        await Promise.all(
-          stored.map((entry) => deleteAttachmentFile(entry.storagePath)),
-        );
-        throw err;
-      }
+      attachments = await this.databaseService.createRequestAttachments({
+        requestId: created.id,
+        organizationId: created.organizationId,
+        employeeId: created.employeeId,
+        expiresAt: computeExpiresAt(),
+        files: stored,
+      });
     }
 
     return {
@@ -310,13 +286,7 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    const paths = await this.supabaseService.deletePendingRequest(
-      employeeCode,
-      requestId,
-    );
-    await Promise.all(
-      paths.map((entry) => deleteAttachmentFile(entry.storagePath)),
-    );
+    await this.databaseService.deletePendingRequest(employeeCode, requestId);
   }
 
   @Get('requests/:requestId/attachments')
@@ -328,7 +298,7 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    return this.supabaseService.listRequestAttachments(requestId);
+    return this.databaseService.listRequestAttachments(requestId);
   }
 
   @Get('requests/:requestId/attachments/:attachmentId')
@@ -342,30 +312,29 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    const attachment = await this.supabaseService.getRequestAttachment(
+    const attachment = await this.databaseService.getRequestAttachment(
       employeeCode,
       attachmentId,
     );
     if (attachment.expiresAt.getTime() <= Date.now()) {
       throw new NotFoundException('Attachment has expired.');
     }
-    const { promises: fs } = await import('fs');
-    try {
-      const buffer = await fs.readFile(attachment.storagePath);
-      response.setHeader(
-        'Content-Type',
-        attachment.mimeType || 'application/octet-stream',
+    if (!attachment.content) {
+      throw new NotFoundException(
+        'Attachment content is not stored in the database.',
       );
-      const encoded = encodeURIComponent(attachment.originalName);
-      response.setHeader(
-        'Content-Disposition',
-        `attachment; filename*=UTF-8''${encoded}`,
-      );
-      response.setHeader('Content-Length', String(buffer.length));
-      response.status(200).end(buffer);
-    } catch {
-      throw new NotFoundException('Attachment file is missing.');
     }
+    response.setHeader(
+      'Content-Type',
+      attachment.mimeType || 'application/octet-stream',
+    );
+    const encoded = encodeURIComponent(attachment.originalName);
+    response.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encoded}`,
+    );
+    response.setHeader('Content-Length', String(attachment.content.length));
+    response.status(200).end(attachment.content);
   }
 
   @Delete('requests/:requestId/attachments/:attachmentId')
@@ -379,11 +348,10 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    const storagePath = await this.supabaseService.deleteRequestAttachment(
+    await this.databaseService.deleteRequestAttachment(
       employeeCode,
       attachmentId,
     );
-    await deleteAttachmentFile(storagePath);
   }
 
   @Get('corrections')
@@ -392,7 +360,7 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    return this.supabaseService.listCorrections(employeeCode);
+    return this.databaseService.listCorrections(employeeCode);
   }
 
   @Get('deductions')
@@ -405,7 +373,7 @@ export class PortalController {
       throw new UnauthorizedException('Not signed in.');
     }
     const cycleKey = cycle?.trim() || undefined;
-    const data = await this.supabaseService.getPayrollDeduction(
+    const data = await this.databaseService.getPayrollDeduction(
       employeeCode,
       cycleKey,
     );
@@ -435,7 +403,7 @@ export class PortalController {
       throw new UnauthorizedException('Description is required.');
     }
 
-    return this.supabaseService.createCorrection(employeeCode, {
+    return this.databaseService.createCorrection(employeeCode, {
       dailyAttendanceId:
         typeof body.dailyAttendanceId === 'string'
           ? body.dailyAttendanceId
@@ -461,7 +429,7 @@ export class PortalController {
     if (!employeeCode) {
       throw new UnauthorizedException('Not signed in.');
     }
-    await this.supabaseService.deletePendingCorrection(
+    await this.databaseService.deletePendingCorrection(
       employeeCode,
       correctionId,
     );

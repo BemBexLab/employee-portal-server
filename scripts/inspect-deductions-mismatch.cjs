@@ -12,19 +12,18 @@ const c = process.env.DATABASE_URL.replace(
 );
 const pool = new Pool({ connectionString: c, max: 1 });
 (async () => {
-  // Employees in deductions table whose own monthly_salary is non-zero in employees but zero in deductions
+  // Employees whose live salary differs from the historical deduction snapshot.
   const r = await pool.query(
     `SELECT d.employee_id::text AS employee_id,
-            d.monthly_salary::text AS d_salary,
+            d.monthly_salary::text AS deduction_snapshot_salary,
             e.employee_code,
-            e.monthly_salary::text AS e_salary,
+            e.monthly_salary::text AS live_employee_salary,
             d.payroll_cycle_month
      FROM public.deductions d
      JOIN public.employees e ON e.id = d.employee_id
-     WHERE d.monthly_salary = 0
-       AND e.monthly_salary > 0
-     LIMIT 3`,
+     WHERE d.monthly_salary IS DISTINCT FROM e.monthly_salary
+     LIMIT 20`,
   );
-  console.log('mismatch rows:'); console.table(r.rows);
+  console.log('historical snapshot mismatches:'); console.table(r.rows);
   await pool.end();
 })();

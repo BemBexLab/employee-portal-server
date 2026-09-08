@@ -25,8 +25,8 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
-Copy `.env.example` to `.env` and provide the Supabase values before starting
-the server. Keep `DATABASE_URL` and `SUPABASE_SECRET_KEY` on the server only.
+Copy `.env.example` to `.env` and provide the VPS PostgreSQL connection values
+before starting the server. Keep `DATABASE_URL` on the server only.
 
 ## Database export endpoint
 
@@ -57,6 +57,14 @@ GET http://localhost:4000/portal/employees/108
 The final path segment accepts an employee UUID, employee code, or the email of
 a user linked to an employee. The endpoint intentionally excludes raw database
 tables and sensitive user fields.
+
+Request attachments are stored in the VPS PostgreSQL database as `bytea` in
+`request_attachments.content`, so other VPS-hosted projects can access the
+file bytes directly. Run the attachment migration once when deploying:
+
+```bash
+node scripts/migrate-request-attachments.cjs
+```
 
 ## Project setup
 

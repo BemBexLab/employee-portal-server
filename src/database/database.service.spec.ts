@@ -1,12 +1,12 @@
 import { BadGatewayException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Pool } from 'pg';
-import { SupabaseService } from './supabase.service';
+import { DatabaseService } from './database.service';
 
-describe('SupabaseService', () => {
+describe('DatabaseService', () => {
   const values: Record<string, string> = {
     DATABASE_URL: 'postgresql://example',
-    SUPABASE_TABLE: 'employees',
+    DATABASE_TABLE: 'employees',
   };
   const configService = {
     get: jest.fn((name: string) => values[name]),
@@ -14,11 +14,11 @@ describe('SupabaseService', () => {
   const query = jest.fn();
   const end = jest.fn();
   const pool = { query, end } as unknown as Pool;
-  let service: SupabaseService;
+  let service: DatabaseService;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new SupabaseService(configService, pool);
+    service = new DatabaseService(configService, pool);
   });
 
   it('returns paginated employee data', async () => {
@@ -153,11 +153,10 @@ describe('SupabaseService', () => {
             late_half_day_deduction_days: 1,
             total_deduction_days: 1,
             monthly_salary: '60000.00',
-            employee_monthly_salary: '60000.00',
             employee_allowance: '5000.00',
-            payroll_days: 32,
-            daily_rate: '1875.00',
-            deduction_amount: '6875.00',
+            payroll_days: 31,
+            bonus_amount: '20000.00',
+            commission_amount: '3500.00',
             calculated_through: '2026-09-04',
           },
         ],
@@ -171,10 +170,12 @@ describe('SupabaseService', () => {
       lateHalfDayDeductionDays: 1,
       totalDeductionDays: 1,
       monthlySalary: 60000,
-      payrollDays: 32,
-      dailyRate: 1875,
-      deductionAmount: 6875,
+      payrollDays: 31,
+      dailyRate: 1935.48,
+      deductionAmount: 6935.48,
       allowanceAmount: 5000,
+      bonusAmount: 20000,
+      commissionAmount: 3500,
       calculatedThrough: '2026-09-04',
     });
 
@@ -204,6 +205,62 @@ describe('SupabaseService', () => {
       expect.stringContaining('AND d.payroll_cycle_month = $2'),
       ['employee-uuid-108', '2026-08'],
     );
+  });
+
+  it('stores attachment bytes in the database for every file', async () => {
+    query.mockResolvedValue({
+      rows: [
+        {
+          id: 'attachment-1',
+          original_name: 'one.pdf',
+          stored_name: 'stored-one.pdf',
+          mime_type: 'application/pdf',
+          size_bytes: '3',
+          uploaded_at: new Date('2026-08-01T00:00:00.000Z'),
+          expires_at: new Date('2026-08-03T00:00:00.000Z'),
+        },
+        {
+          id: 'attachment-2',
+          original_name: 'two.pdf',
+          stored_name: 'stored-two.pdf',
+          mime_type: 'application/pdf',
+          size_bytes: '3',
+          uploaded_at: new Date('2026-08-01T00:00:00.000Z'),
+          expires_at: new Date('2026-08-03T00:00:00.000Z'),
+        },
+      ],
+    });
+    const first = Buffer.from('one');
+    const second = Buffer.from('two');
+
+    await service.createRequestAttachments({
+      requestId: 'request-uuid',
+      organizationId: 'organization-uuid',
+      employeeId: 'employee-uuid',
+      expiresAt: new Date('2026-08-03T00:00:00.000Z'),
+      files: [
+        {
+          originalName: 'one.pdf',
+          storedName: 'stored-one.pdf',
+          mimeType: 'application/pdf',
+          sizeBytes: first.length,
+          content: first,
+        },
+        {
+          originalName: 'two.pdf',
+          storedName: 'stored-two.pdf',
+          mimeType: 'application/pdf',
+          sizeBytes: second.length,
+          content: second,
+        },
+      ],
+    });
+
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('content');
+    expect(sql).toContain('$10::timestamptz');
+    expect(sql).toContain('$20::timestamptz');
+    expect(params).toEqual(expect.arrayContaining([first, second]));
   });
 
   it.each([

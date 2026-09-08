@@ -12,12 +12,12 @@ import { ConfigService } from '@nestjs/config';
 import { Pool, QueryResultRow } from 'pg';
 
 @Injectable()
-export class SupabaseService implements OnModuleDestroy {
+export class DatabaseService implements OnModuleDestroy {
   private readonly pool: Pool;
 
   constructor(
     private readonly configService: ConfigService,
-    @Optional() @Inject('SUPABASE_DATABASE_POOL') pool?: Pool,
+    @Optional() @Inject('DATABASE_POOL') pool?: Pool,
   ) {
     const connectionString = this.getRequiredConfig('DATABASE_URL');
     const poolConnectionString = connectionString.replace(
@@ -43,11 +43,11 @@ export class SupabaseService implements OnModuleDestroy {
     }
 
     const table =
-      this.configService.get<string>('SUPABASE_TABLE') ?? 'employees';
+      this.configService.get<string>('DATABASE_TABLE') ?? 'employees';
 
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
       throw new InternalServerErrorException(
-        'SUPABASE_TABLE must be a valid table name',
+        'DATABASE_TABLE must be a valid table name',
       );
     }
 
@@ -197,6 +197,8 @@ export class SupabaseService implements OnModuleDestroy {
     dailyRate: number;
     deductionAmount: number;
     allowanceAmount: number;
+    bonusAmount: number;
+    commissionAmount: number;
     calculatedThrough: string | null;
   } | null> {
     const identifier = employeeId.trim();
@@ -235,12 +237,11 @@ export class SupabaseService implements OnModuleDestroy {
         absent_days: number;
         late_half_day_deduction_days: number;
         total_deduction_days: number;
-        monthly_salary: string;
-        employee_monthly_salary: string | null;
+        monthly_salary: string | null;
         employee_allowance: string | null;
         payroll_days: number;
-        daily_rate: string;
-        deduction_amount: string;
+        bonus_amount: string;
+        commission_amount: string;
         calculated_through: string | null;
       }>(
         `SELECT
@@ -250,15 +251,23 @@ export class SupabaseService implements OnModuleDestroy {
            d.absent_days,
            d.late_half_day_deduction_days,
            d.total_deduction_days,
-           d.monthly_salary::text AS monthly_salary,
-           e.monthly_salary::text AS employee_monthly_salary,
+           e.monthly_salary::text AS monthly_salary,
            e.allowance::text AS employee_allowance,
            d.payroll_days,
-           d.daily_rate::text AS daily_rate,
-           d.deduction_amount::text AS deduction_amount,
+           earnings.bonus_amount,
+           earnings.commission_amount,
            d.calculated_through
          FROM public.deductions d
          JOIN public.employees e ON e.id = d.employee_id
+         LEFT JOIN LATERAL (
+           SELECT
+             COALESCE(SUM(earning.amount) FILTER (WHERE UPPER(earning.type::text) = 'BONUS'), 0)::text AS bonus_amount,
+             COALESCE(SUM(earning.amount) FILTER (WHERE UPPER(earning.type::text) = 'COMMISSION'), 0)::text AS commission_amount
+           FROM public.employee_earnings earning
+           WHERE earning.employee_id = d.employee_id
+             AND earning.payroll_cycle_month = d.payroll_cycle_month
+             AND UPPER(earning.status::text) = 'APPROVED'
+         ) earnings ON TRUE
          WHERE d.employee_id = $1
            ${cycleFilter}
          ORDER BY d.payroll_cycle_month DESC, d.updated_at DESC
@@ -269,24 +278,21 @@ export class SupabaseService implements OnModuleDestroy {
       const row = result.rows[0];
       if (!row) return null;
 
-      const monthlySalary =
-        row.monthly_salary !== null && Number(row.monthly_salary) > 0
-          ? Number(row.monthly_salary)
-          : row.employee_monthly_salary !== null
-            ? Number(row.employee_monthly_salary)
-            : 0;
+      const monthlySalary = Math.max(0, Number(row.monthly_salary) || 0);
       const dailyRate =
         monthlySalary > 0 && row.payroll_days > 0
           ? Math.round((monthlySalary / row.payroll_days) * 100) / 100
-          : Number(row.daily_rate);
-      const deductionAmount = Math.max(
-        0,
-        Number(row.deduction_amount) || 0,
-      );
+          : 0;
       const allowanceAmount =
         row.total_deduction_days >= 1
           ? Math.max(0, Number(row.employee_allowance) || 0)
           : 0;
+      const deductionAmount =
+        Math.round(
+          (dailyRate * row.total_deduction_days + allowanceAmount) * 100,
+        ) / 100;
+      const bonusAmount = Math.max(0, Number(row.bonus_amount) || 0);
+      const commissionAmount = Math.max(0, Number(row.commission_amount) || 0);
 
       return {
         cycle: row.payroll_cycle_month,
@@ -300,6 +306,8 @@ export class SupabaseService implements OnModuleDestroy {
         dailyRate,
         deductionAmount,
         allowanceAmount,
+        bonusAmount,
+        commissionAmount,
         calculatedThrough: row.calculated_through,
       };
     } catch {
@@ -499,7 +507,7 @@ export class SupabaseService implements OnModuleDestroy {
         { limit: number; offset: number; count: number; total: number }
       > = {};
       const employeeTable =
-        this.configService.get<string>('SUPABASE_TABLE') ?? 'employees';
+        this.configService.get<string>('DATABASE_TABLE') ?? 'employees';
       let resolvedEmployeeId = normalizedEmployeeId;
 
       if (normalizedEmployeeId) {
@@ -803,10 +811,10 @@ export class SupabaseService implements OnModuleDestroy {
         throw new NotFoundException('Request not found.');
       }
 
-      const attachments = await this.pool.query<{ storage_path: string }>(
+      const attachments = await this.pool.query(
         `DELETE FROM request_attachments
          WHERE request_id = $1 AND employee_id = $2
-         RETURNING storage_path`,
+         RETURNING id`,
         [targetId, employeePk],
       );
 
@@ -822,10 +830,6 @@ export class SupabaseService implements OnModuleDestroy {
       if (result.rowCount === 0 && attachments.rowCount === 0) {
         throw new NotFoundException('Pending request not found.');
       }
-
-      return attachments.rows.map((row) => ({
-        storagePath: row.storage_path,
-      }));
     } catch (err) {
       if (
         err instanceof BadRequestException ||
@@ -1074,7 +1078,7 @@ export class SupabaseService implements OnModuleDestroy {
       storedName: string;
       mimeType: string;
       sizeBytes: number;
-      storagePath: string;
+      content: Buffer;
     }>;
   }) {
     if (args.files.length === 0) return [];
@@ -1082,9 +1086,9 @@ export class SupabaseService implements OnModuleDestroy {
       const values: unknown[] = [];
       const placeholders: string[] = [];
       args.files.forEach((file, index) => {
-        const base = index * 8;
+        const base = index * 10;
         placeholders.push(
-          `($${base + 1}::uuid, $${base + 2}::uuid, $${base + 3}::uuid, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::bigint, $${base + 8}, $${base + 9}::timestamptz)`,
+          `($${base + 1}::uuid, $${base + 2}::uuid, $${base + 3}::uuid, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::bigint, $${base + 8}, $${base + 9}::bytea, $${base + 10}::timestamptz)`,
         );
         values.push(
           args.requestId,
@@ -1094,7 +1098,8 @@ export class SupabaseService implements OnModuleDestroy {
           file.storedName,
           file.mimeType,
           file.sizeBytes,
-          file.storagePath,
+          null,
+          file.content,
           args.expiresAt,
         );
       });
@@ -1108,7 +1113,7 @@ export class SupabaseService implements OnModuleDestroy {
         expires_at: Date;
       }>(
         `INSERT INTO request_attachments
-           (request_id, organization_id, employee_id, original_name, stored_name, mime_type, size_bytes, storage_path, expires_at)
+           (request_id, organization_id, employee_id, original_name, stored_name, mime_type, size_bytes, storage_path, content, expires_at)
          VALUES ${placeholders.join(', ')}
          RETURNING id, original_name, stored_name, mime_type, size_bytes, uploaded_at, expires_at`,
         values,
@@ -1182,10 +1187,10 @@ export class SupabaseService implements OnModuleDestroy {
         stored_name: string;
         mime_type: string;
         size_bytes: string;
-        storage_path: string;
+        content: Buffer | null;
         expires_at: Date;
       }>(
-        `SELECT id, original_name, stored_name, mime_type, size_bytes, storage_path, expires_at
+        `SELECT id, original_name, stored_name, mime_type, size_bytes, content, expires_at
          FROM request_attachments
          WHERE id = $1 AND employee_id = $2
          LIMIT 1`,
@@ -1201,7 +1206,7 @@ export class SupabaseService implements OnModuleDestroy {
         storedName: row.stored_name,
         mimeType: row.mime_type,
         sizeBytes: Number(row.size_bytes),
-        storagePath: row.storage_path,
+        content: row.content,
         expiresAt: row.expires_at,
       };
     } catch (err) {
@@ -1233,16 +1238,15 @@ export class SupabaseService implements OnModuleDestroy {
       if (!employeePk) {
         throw new NotFoundException('Attachment not found.');
       }
-      const result = await this.pool.query<{ storage_path: string }>(
+      const result = await this.pool.query<{ id: string }>(
         `DELETE FROM request_attachments
          WHERE id = $1 AND employee_id = $2
-         RETURNING storage_path`,
+         RETURNING id`,
         [target, employeePk],
       );
       if (result.rowCount === 0) {
         throw new NotFoundException('Attachment not found.');
       }
-      return result.rows[0].storage_path;
     } catch (err) {
       if (
         err instanceof BadRequestException ||
@@ -1254,15 +1258,12 @@ export class SupabaseService implements OnModuleDestroy {
     }
   }
 
-  async findExpiredAttachmentPaths(now: Date) {
+  async deleteExpiredAttachments(now: Date) {
     try {
-      const result = await this.pool.query<{
-        id: string;
-        storage_path: string;
-      }>(
+      const result = await this.pool.query<{ id: string }>(
         `DELETE FROM request_attachments
          WHERE expires_at <= $1
-         RETURNING id, storage_path`,
+         RETURNING id`,
         [now],
       );
       return result.rows;

@@ -4,8 +4,7 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { SupabaseService } from '../supabase/supabase.service';
-import { deleteAttachmentFile } from './attachment-storage';
+import { DatabaseService } from '../database/database.service';
 
 const SWEEP_INTERVAL_MS = 1000 * 60 * 30;
 
@@ -15,7 +14,7 @@ export class AttachmentSweeper implements OnModuleInit, OnModuleDestroy {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly databaseService: DatabaseService) {}
 
   onModuleInit() {
     if (this.timer) return;
@@ -45,16 +44,11 @@ export class AttachmentSweeper implements OnModuleInit, OnModuleDestroy {
     if (this.running) return;
     this.running = true;
     try {
-      const expired = await this.supabaseService.findExpiredAttachmentPaths(
+      const expired = await this.databaseService.deleteExpiredAttachments(
         new Date(),
       );
       if (expired.length === 0) return;
       this.logger.log(`Sweeping ${expired.length} expired attachment(s).`);
-      await Promise.all(
-        expired.map(async (entry) => {
-          await deleteAttachmentFile(entry.storage_path);
-        }),
-      );
     } catch (err) {
       this.logger.error(
         `Attachment sweep failed: ${err instanceof Error ? err.message : 'unknown error'}`,

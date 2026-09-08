@@ -14,10 +14,13 @@ const c = url.replace(
 const pool = new Pool({ connectionString: c, max: 1 });
 (async () => {
   const r = await pool.query(
-    `SELECT monthly_salary::text, payroll_days, daily_rate::text, deduction_amount::text,
-            late_days, half_days, absent_days, late_half_day_deduction_days, total_deduction_days
-     FROM public.deductions
-     WHERE monthly_salary > 0
+    `SELECT e.monthly_salary::text, d.payroll_days,
+            ROUND(e.monthly_salary / NULLIF(d.payroll_days, 0), 2)::text AS daily_rate,
+            d.late_days, d.half_days, d.absent_days,
+            d.late_half_day_deduction_days, d.total_deduction_days
+     FROM public.deductions d
+     JOIN public.employees e ON e.id = d.employee_id
+     WHERE e.monthly_salary > 0
      LIMIT 5`,
   );
   console.log('rows with salary:'); console.table(r.rows);

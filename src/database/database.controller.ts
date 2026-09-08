@@ -5,11 +5,11 @@ import {
   ParseIntPipe,
   Query,
 } from '@nestjs/common';
-import { SupabaseService } from './supabase.service';
+import { DatabaseService } from './database.service';
 
 @Controller('database')
 export class DatabaseController {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly databaseService: DatabaseService) {}
 
   @Get('data')
   getDatabaseData(
@@ -17,6 +17,6 @@ export class DatabaseController {
     @Query('offset', new DefaultValuePipe(0), ParseIntPipe) offset: number,
     @Query('employeeId') employeeId?: string,
   ) {
-    return this.supabaseService.getDatabaseData(limit, offset, employeeId);
+    return this.databaseService.getDatabaseData(limit, offset, employeeId);
   }
 }
