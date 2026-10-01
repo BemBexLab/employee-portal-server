@@ -237,6 +237,7 @@ export class DatabaseService implements OnModuleDestroy {
         absent_days: number;
         late_half_day_deduction_days: number;
         total_deduction_days: number;
+        deduction_amount: string | null;
         monthly_salary: string | null;
         employee_allowance: string | null;
         payroll_days: number;
@@ -251,6 +252,7 @@ export class DatabaseService implements OnModuleDestroy {
            d.absent_days,
            d.late_half_day_deduction_days,
            d.total_deduction_days,
+           d.deduction_amount::text AS deduction_amount,
            e.monthly_salary::text AS monthly_salary,
            e.allowance::text AS employee_allowance,
            d.payroll_days,
@@ -287,10 +289,10 @@ export class DatabaseService implements OnModuleDestroy {
         row.total_deduction_days >= 1
           ? Math.max(0, Number(row.employee_allowance) || 0)
           : 0;
-      const deductionAmount =
-        Math.round(
-          (dailyRate * row.total_deduction_days + allowanceAmount) * 100,
-        ) / 100;
+      // The VPS stores the final deduction (including any allowance
+      // deduction) in this column. Do not reconstruct it from live employee
+      // values, which may differ from the payroll calculation for the cycle.
+      const deductionAmount = Math.max(0, Number(row.deduction_amount) || 0);
       const bonusAmount = Math.max(0, Number(row.bonus_amount) || 0);
       const commissionAmount = Math.max(0, Number(row.commission_amount) || 0);
 
